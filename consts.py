@@ -1,0 +1,22 @@
+IMG_PATH = "./Images"
+VERBOSE = True
+REWRITE = True
+RETRAIN = True
+N_PROCESSES = 4
+
+N_SEGMENTS = 200
+
+IMG_WIDTH = 500
+IMG_HEIGHT = 500
+PATCH_WIDTH = 10
+PATCH_HEIGHT = 10
+
+FIGSIZE = (10, 10)
+
+EPS = 0.0625
+C = 0.125
+
+MODEL_U = "U.model"
+MODEL_V = "V.model"
+DATA_EXT = ".data.npy"
+GREY_EXT = ".grey"
