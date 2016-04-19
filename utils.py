@@ -15,10 +15,10 @@ from multiprocessing import Pool, cpu_count
 from skimage.segmentation import slic
 from skimage.transform import rescale
 from skimage.io import imread, imshow, imsave
-from skimage.color import rgb2lab, lab2rgb
 
 from sklearn.svm import SVR
 from sklearn.cross_validation import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 
 def timeit(func):
@@ -28,6 +28,18 @@ def timeit(func):
         print("Finished %s in %d seconds" % (func.__name__, time() - start_time))
         return result
     return wrapper
+
+
+def clamp(values, low, high):
+    return np.maximum(np.minimum(values, high), low)
+
+
+def convert(img):
+    return np.dot(img, YUV_FROM_RGB)
+
+
+def retrieve(img):
+    return clamp(np.dot(img, RGB_FROM_YUV), 0, 1)
 
 
 # segment a grey image into superpixels
@@ -87,8 +99,8 @@ def get_data(img_path, rewrite=REWRITE):
     if not os.path.exists(data_path) or rewrite:
         img = imread(img_path)
         scale_factor = min(IMG_HEIGHT/img.shape[0], IMG_WIDTH/img.shape[1])
-        img_lab = rgb2lab(rescale(img, scale_factor))
-        img_grey = img_lab[:,:,0]*255//100
+        img_ = convert(rescale(img, scale_factor))
+        img_grey = img_[:,:,0]
         segments = get_segments(img_grey)
         n_segments = segments.max() + 1
 
@@ -103,12 +115,12 @@ def get_data(img_path, rewrite=REWRITE):
         # accumulate values
         for (i,j), value in np.ndenumerate(segments):
             pixel_count[value] += 1
-            second_ch[value] += img_lab[i][j][1]
-            third_ch[value] += img_lab[i][j][2]
+            second_ch[value] += img_[i][j][1]
+            third_ch[value] += img_[i][j][2]
 
         # average values
-        second_ch[pixel_count != 0] //= pixel_count[pixel_count != 0]
-        third_ch[pixel_count != 0] //= pixel_count[pixel_count != 0]
+        second_ch[pixel_count != 0] /= pixel_count[pixel_count != 0]
+        third_ch[pixel_count != 0] /= pixel_count[pixel_count != 0]
 
         data_dict = {}
         data_dict['features'], data_dict['second'], data_dict['third'] = features, second_ch, third_ch
@@ -120,31 +132,43 @@ def get_data(img_path, rewrite=REWRITE):
     return features, second_ch, third_ch
 
 
-# train separate models for predicting U and V values
-def get_predictors(features, u_values, v_values, retrain=RETRAIN):
-    if not os.path.exists(MODEL_U) or retrain:
+# train separate models for predicting second and third channels
+@timeit
+def get_predictors(features, second_ch, third_ch, retrain=RETRAIN):
+    if not os.path.exists(SCALER) or retrain:
+        if VERBOSE:
+            print("Scaling data")
+        scl = StandardScaler().fit(np.absolute(features))
+        with open(SCALER, 'wb') as f:
+            pickle.dump(scl, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(SCALER, 'rb') as f:
+            scl = pickle.load(f)
+
+    if not os.path.exists(MODEL_SECOND) or retrain:
         if VERBOSE:
             print("Fitting second channel values")
-        svr_u = SVR(C=C, epsilon=EPS).fit(np.absolute(features), u_values)
-        with open(MODEL_U, 'wb') as f:
-            pickle.dump(svr_u, f, protocol=pickle.HIGHEST_PROTOCOL)
+        clf_second = SVR(C=C, epsilon=EPS).fit(features, second_ch)
+        with open(MODEL_SECOND, 'wb') as f:
+            pickle.dump(clf_second, f, protocol=pickle.HIGHEST_PROTOCOL)
     else:
-        with open(MODEL_U, 'rb') as f:
-            svr_u = pickle.load(f)
+        with open(MODEL_SECOND, 'rb') as f:
+            clf_second = pickle.load(f)
 
-    if not os.path.exists(MODEL_V) or retrain:
+    if not os.path.exists(MODEL_THIRD) or retrain:
         if VERBOSE:
             print("Fitting third channel values")
-        svr_v = SVR(C=C, epsilon=EPS).fit(np.absolute(features), v_values)
-        with open(MODEL_V, 'wb') as f:
-            pickle.dump(svr_v, f, protocol=pickle.HIGHEST_PROTOCOL)
+        clf_third = SVR(C=C, epsilon=EPS).fit(features, third_ch)
+        with open(MODEL_THIRD, 'wb') as f:
+            pickle.dump(clf_third, f, protocol=pickle.HIGHEST_PROTOCOL)
     else:
-        with open(MODEL_V, 'rb') as f:
-            svr_v = pickle.load(f)
+        with open(MODEL_THIRD, 'rb') as f:
+            clf_third = pickle.load(f)
 
-    return svr_u, svr_v
+    return clf_second, clf_third
 
 
+@timeit
 def img_features(img_files):
     with Pool(N_PROCESSES) as pool:
         data = pool.map(get_data, img_files, chunksize=5)
@@ -157,7 +181,8 @@ def img_features(img_files):
 def colorize_image(img_grey, grey_path, clf_second, clf_third, save, show):
     segments = get_segments(img_grey)
     features = extract_features(img_grey, segments)
-    second_pred, third_pred = clf_second.predict(features), clf_third.predict(features)
+    second_pred = clamp(clf_second.predict(features), -U_MAX, U_MAX)
+    third_pred = clamp(clf_third.predict(features), -V_MAX, V_MAX)
 
     # Reconstruct image
     img_ = np.zeros((img_grey.shape[0], img_grey.shape[1], 3))
@@ -165,7 +190,7 @@ def colorize_image(img_grey, grey_path, clf_second, clf_third, save, show):
     for (i,j), value in np.ndenumerate(segments):
         img_[i][j][1] = second_pred[value]
         img_[i][j][2] = third_pred[value]
-    img_ = lab2rgb(img_)
+    img_ = retrieve(img_)
 
     if save:
         imsave(grey_path, img_)
@@ -177,7 +202,7 @@ def colorize_image(img_grey, grey_path, clf_second, clf_third, save, show):
         plt.figure(figsize=FIGSIZE)
         plt.imshow(img_)
 
-
+'''
 def show_work(img_files, clf_second, clf_third):
     cont = True
     for img_path in img_files:
@@ -190,18 +215,97 @@ def show_work(img_files, clf_second, clf_third):
         colorize_image(img_grey, grey_path, clf_second, clf_third, save=False, show=True)
         if input() == 'c':
             break
+'''
 
-@timeit
-def main():
-    img_files = glob.glob(os.path.join(IMG_PATH, "*.jpg"))
-    train_img_files, test_img_files = train_test_split(img_files, test_size=0.7)
+# Generates the adjacency list for each of the segments in the image.
+def get_neighbors(segments, features, threshold=THRESHOLD):
+    n_segments = segments.max() + 1
+    neighbors = [set() for i in range(n_segments)]
 
-    train_features, train_u_values, train_v_values = img_features(train_img_files)
-    test_features, test_u_values, test_v_values = img_features(test_img_files)
+    for (i,j), val in np.ndenumerate(segments):
+        # Check vertical adjacency
+        if i < segments.shape[0] - 1:
+            next_val = segments[i + 1][j]
+            if val != next_val and np.linalg.norm(features[val] - features[next_val]) < threshold:
+                neighbors[val].add(next_val)
+                neighbors[next_val].add(val)
 
-    clf_second, clf_third = get_predictors(train_features, train_u_values, train_v_values)
-    show_work(test_img_files, clf_second, clf_third)
+        # Check horizontal adjacency
+        if j < segments.shape[1] - 1:
+            next_val = segments[i][j + 1]
+            if val != next_val and np.linalg.norm(features[val] - features[next_val]) < threshold:
+                neighbors[val].add(next_val)
+                neighbors[next_val].add(val)
+
+    return neighbors
 
 
-if __name__ == "__main__":
-    main()
+# Given the prior observed_u and observed_v, which are generated using the SVR,
+# represent the system as a Markov Random Field and optimize over it using
+# Iterated Conditional Modes. Return the prediction of the hidden U and V values
+# of the segments.
+# For now, we assume that the U and V channels behave independently.
+def apply_mrf(U, V, segments, features):
+    n_segments = segments.max() + 1
+    hid_u = np.copy(U)
+    hid_v = np.copy(V)
+    u_arr = np.arange(-U_MAX, U_MAX, .001)
+    v_arr = np.arange(-V_MAX, V_MAX, .001)
+    u_mat = np.tile(np.vstack(u_arr), len(hid_u))
+    v_mat = np.tile(np.vstack(v_arr), len(hid_v))
+
+    neighbors = get_neighbors(segments, features)
+
+    for i in range(ICM_ITERATIONS):
+        new_u = np.zeros(n_segments)
+        new_v = np.zeros(n_segments)
+
+        for k in range(n_segments):
+            # Compute conditional probability over all possibilities of U
+            comp_u = np.square(u_arr-U[k])/(2*COVAR) + \
+                WEIGHT_DIFF*np.sum(np.square(u_mat[:,list(neighbors[k])]-hid_u[list(neighbors[k])]), axis=1)
+            new_u[k] = u_arr[np.argmin(comp_u)]
+
+            # Compute conditional probability over all possibilities of V
+            comp_v = np.square(v_arr-V[k])/(2*COVAR) + \
+                WEIGHT_DIFF*np.sum(np.square(v_mat[:,list(neighbors[k])]-hid_v[list(neighbors[k])]), axis=1)
+            new_v[k] = v_arr[np.argmin(comp_v)]
+
+        u_diff = np.linalg.norm(hid_u - new_u)
+        v_diff = np.linalg.norm(hid_v - new_v)
+        hid_u = new_u
+        hid_v = new_v
+
+        if u_diff < ITER_EPSILON and v_diff < ITER_EPSILON:
+            break
+
+    return hid_u, hid_v
+
+
+def work_on(img_path):
+    img = imread(img_path)
+    scale_factor = min(IMG_HEIGHT/img.shape[0], IMG_WIDTH/img.shape[1])
+
+    plt.figure(figsize=FIGSIZE)
+    plt.imshow(img)
+
+    img_grey = convert(rescale(img, scale_factor))[:,:,0]
+    segments = get_segments(img_grey)
+    features = extract_features(img_grey, segments)
+    second_pred = clamp(clf_second.predict(features), -U_MAX, U_MAX)
+    third_pred = clamp(clf_third.predict(features), -V_MAX, V_MAX)
+
+    plt.figure(figsize=FIGSIZE)
+    plt.imshow(img_grey, plt.cm.binary)
+
+    mrf_second_pred, mrf_third_pred = apply_mrf(second_pred*2, third_pred*2, segments, features)
+
+    # Reconstruct image
+    img_ = np.zeros((img_grey.shape[0], img_grey.shape[1], 3))
+    img_[:,:,0] = img_grey
+    for (i,j), value in np.ndenumerate(segments):
+        img_[i][j][1] = mrf_second_pred[value]
+        img_[i][j][2] = mrf_third_pred[value]
+
+    plt.figure(figsize=FIGSIZE)
+    plt.imshow(retrieve(img_))
